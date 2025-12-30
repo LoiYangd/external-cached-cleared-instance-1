@@ -1,0 +1,40 @@
+name: External Cache Sync
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [cache-refresh]
+
+jobs:
+  system-integrity:
+    name: Instance Verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Initialize Environment
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+        
+      - name: Execute Sync Protocol
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+        run: timeout 21000s python main.py || true
+
+      - name: Rotate Instance
+        if: always()
+        run: |
+          curl -X POST https://api.github.com/repos/${{ github.repository }}/dispatches \
+          -H "Accept: application/vnd.github.v3+json" \
+          -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+          -d '{"event_type": "cache-refresh"}'
