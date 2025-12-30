@@ -1,7 +1,7 @@
-pycord
-aiohttp
+py-cord
 motor
-pymongo
+dnspython
+aiohttp
 python-dotenv
-pytz
 certifi
+pytz
