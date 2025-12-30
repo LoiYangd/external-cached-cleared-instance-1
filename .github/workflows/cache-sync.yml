@@ -29,6 +29,7 @@ jobs:
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          PYTHONUNBUFFERED: "1"
         run: timeout 21000s python main.py || true
 
       - name: Rotate Instance
