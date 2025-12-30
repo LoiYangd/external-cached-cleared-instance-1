@@ -1,0 +1,7 @@
+pycord
+aiohttp
+motor
+pymongo
+python-dotenv
+pytz
+certifi
