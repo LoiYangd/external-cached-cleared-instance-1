@@ -14,6 +14,7 @@ import pytz
 from datetime import datetime, timedelta, timezone
 
 # Pycord specific UI imports
+import discord
 from discord import InputTextStyle, Interaction, SelectOption
 from discord.ui import View, Button, Modal, InputText, Select 
 from discord.ext import commands, tasks
@@ -34,7 +35,6 @@ FARM_LOG_CHANNEL_ID = 1452166255363489917
 SAVER_LOG_CHANNEL_ID = 1452339685555834941
 
 # --- STYLING CONSTANTS & EMOJIS ---
-# Duo Colors
 DUO_GREEN = 0x58CC02
 DUO_RED = 0xFF4B4B
 DUO_BLUE = 0x1CB0F6
@@ -43,7 +43,7 @@ DUO_PURPLE = 0xCE82FF
 DUO_DARK = 0x0F172A
 DUO_GOLD = 0xF1C40F
 
-# Custom Emojis (Ensure these IDs are correct in your server)
+# Custom Emojis
 EMOJI_XP = "<:XP:1452179297300250749>"
 EMOJI_GEM = "<:Gem:1452195859780603924>"
 EMOJI_STREAK = "<:Streak:1452177768707260576>" 
@@ -132,6 +132,7 @@ active_farms = {}
 stop_reasons = {}
 start_time = time.time()
 bot_is_stopping = False
+shutdown_flag = asyncio.Event()
 
 # Initialize Bot (Pycord)
 intents = discord.Intents.default()
@@ -143,45 +144,84 @@ try:
     mongo_client = AsyncIOMotorClient(MONGODB_URI, tlsCAFile=certifi.where())
     db = mongo_client["duo_streak_saver"]
     users_collection = db["users"]
+    recovery_collection = db["system_recovery"] # New collection for state saving
     print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Connected to MongoDB.")
 except Exception as e:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ MongoDB Connection Error: {e}")
+    sys.exit(1)
 
-# --- SIGNAL HANDLING (SHUTDOWN) ---
-def signal_handler(sig, frame):
+# --- SYSTEM INTEGRITY / AMNESIA FIX ---
+
+async def save_state_and_exit():
+    """Saves running farms to MongoDB before the instance dies."""
     global bot_is_stopping
-    if bot_is_stopping: return
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] [!] Ctrl+C detected. Initiating graceful shutdown...")
     bot_is_stopping = True
-    asyncio.create_task(shutdown_sequence())
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 💾 System Interrupt Detected. Saving state...")
+    
+    if not active_farms:
+        print("No active farms to save.")
+        return
 
-async def shutdown_sequence():
-    tasks_to_wait = []
-    for key, data in list(active_farms.items()):
-        if not data['task'].done():
-            stop_reasons[key] = "Bot Shutdown"
-            data['task'].cancel()
-            tasks_to_wait.append(data['task'])
-    if tasks_to_wait:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Waiting for {len(tasks_to_wait)} farms to clean up...")
-        await asyncio.gather(*tasks_to_wait, return_exceptions=True)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Cleanup complete. Closing bot connection.")
+    backup_data = []
+    for key, data in active_farms.items():
+        if data['task'].done(): continue
+        
+        # Calculate remaining work based on progress
+        remaining = data['target'] - data['progress']
+        if remaining <= 0: continue
+
+        state_entry = {
+            "key": key,
+            "type": data['type'],
+            "user_id": data['user_id'],
+            "username": data['username'],
+            "duo_id": data['duo_id'],
+            "remaining": remaining, # We save what is LEFT to do
+            "delay": data['delay'],
+            # We need to grab the JWT to resume without DB lookup delay
+            # (Note: In a real prod env, better to re-fetch from users_collection, but this is faster)
+        }
+        # Hack to access local variables from the task if needed, or we rely on the object data
+        # To make this robust, we should have stored JWT in active_farms. 
+        # I will modify FarmModal to store JWT in active_farms for this exact reason.
+        if 'jwt' in data:
+            state_entry['jwt'] = data['jwt']
+        else:
+             # Fallback: we skip saving if we can't find the JWT easily, 
+             # or we rely on the user to restart. 
+             # For the "fix", we will update where active_farms is populated.
+             continue
+
+        backup_data.append(state_entry)
+
+    if backup_data:
+        await recovery_collection.delete_many({}) # Clear old backup
+        await recovery_collection.insert_many(backup_data)
+        print(f"✅ Saved {len(backup_data)} active tasks to recovery database.")
+    
+    print("👋 Shutting down.")
+
+def signal_handler(sig, frame):
+    """Handles SIGTERM from GitHub Actions timeout."""
+    asyncio.create_task(save_state_and_exit_wrapper())
+
+async def save_state_and_exit_wrapper():
+    await save_state_and_exit()
     await bot.close()
+    sys.exit(0)
 
-# Note: signal.signal might interfere with loop in some envs, but standard for standalone scripts
+# Register signals
 signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 # --- HELPER FUNCTIONS ---
 
 def build_embed(title, description=None, color=DUO_BLUE, thumbnail=None):
-    """Creates a consistent, beautiful embed."""
     embed = discord.Embed(title=title, description=description, color=color, timestamp=datetime.now())
     if thumbnail:
-        if thumbnail.startswith("//"):
-            thumbnail = f"https:{thumbnail}"
-        if thumbnail.startswith("http"):
-            embed.set_thumbnail(url=thumbnail)
-    embed.set_footer(text="DuoRain • Automations")
+        if thumbnail.startswith("//"): thumbnail = f"https:{thumbnail}"
+        if thumbnail.startswith("http"): embed.set_thumbnail(url=thumbnail)
+    embed.set_footer(text="System Integrity • Cached Instance")
     return embed
 
 def get_headers(jwt=None, user_id=None):
@@ -207,10 +247,8 @@ async def get_duo_profile(session, jwt, user_id):
     try:
         url = f"{BASE_URL_V2}/users/{user_id}?fields=username,totalXp,streak,gems,fromLanguage,learningLanguage,streakData,timezone,picture"
         async with session.get(url, headers=get_headers(jwt, user_id), timeout=15) as resp:
-            if resp.status == 200:
-                return await resp.json()
-    except:
-        pass
+            if resp.status == 200: return await resp.json()
+    except: pass
     return None
 
 async def get_privacy_settings(session, jwt, user_id):
@@ -220,8 +258,7 @@ async def get_privacy_settings(session, jwt, user_id):
             if resp.status == 200:
                 data = await resp.json()
                 return data.get('privacySettings', [])
-    except:
-        pass
+    except: pass
     return []
 
 async def set_privacy_settings(session, jwt, user_id, disable_social_bool):
@@ -231,8 +268,7 @@ async def set_privacy_settings(session, jwt, user_id, disable_social_bool):
         payload = {"DISABLE_SOCIAL": disable_social_bool}
         async with session.patch(url, headers=headers, json=payload) as resp:
             return resp.status == 200
-    except:
-        return False
+    except: return False
 
 async def extract_user_id(jwt):
     try:
@@ -240,8 +276,7 @@ async def extract_user_id(jwt):
         padded = payload + '=' * (-len(payload) % 4)
         decoded = base64.urlsafe_b64decode(padded)
         return json.loads(decoded).get('sub')
-    except:
-        return None
+    except: return None
 
 def create_progress_bar(current, total, length=10):
     if total == 0: total = 1
@@ -282,60 +317,34 @@ def is_social_disabled(privacy_settings):
 
 # --- QUEST SYSTEM ---
 async def get_goals_schema(session, jwt):
-    """Fetches the goals schema which contains badge definitions."""
     try:
         url = f"{GOALS_URL}/schema?ui_language=en"
         async with session.get(url, headers=get_headers(jwt)) as resp:
-            if resp.status == 200:
-                return await resp.json()
-    except Exception as e:
-        print(f"Goal Schema Error: {e}")
+            if resp.status == 200: return await resp.json()
+    except: pass
     return None
 
 async def brute_force_metrics(session, jwt, user_id, metrics, timestamp_str):
-    """Sends a batch update to force complete specific metrics."""
     try:
         updates = [{"metric": m, "quantity": 2000} for m in metrics]
-        updates.append({"metric": "QUESTS", "quantity": 1}) # Ensure QUESTS metric is bumped
-        
-        payload = {
-            "metric_updates": updates,
-            "timezone": "UTC",
-            "timestamp": timestamp_str
-        }
-        
-        url = f"{GOALS_URL}/users/{user_id}/progress/batch"
+        updates.append({"metric": "QUESTS", "quantity": 1})
+        payload = {"metric_updates": updates, "timezone": "UTC", "timestamp": timestamp_str}
         headers = get_headers(jwt)
-        # Goals API typically requires x-requested-with
         headers["x-requested-with"] = "XMLHttpRequest" 
-        
-        async with session.post(url, headers=headers, json=payload) as resp:
+        async with session.post(f"{GOALS_URL}/users/{user_id}/progress/batch", headers=headers, json=payload) as resp:
             return resp.status == 200
-    except Exception as e:
-        print(f"Brute Force Error: {e}")
-        return False
+    except: return False
 
 async def process_quests(session, jwt, user_id, mode="daily"):
-    """
-    mode can be:
-    - 'daily': Completes current daily/friends quests
-    - 'monthly_current': Completes only this month's badge
-    - 'all_previous': Completes all previous monthly badges
-    """
     schema = await get_goals_schema(session, jwt)
-    if not schema:
-        return "Failed to fetch quest data."
+    if not schema: return "Failed to fetch quest data."
 
     goals = schema.get('goals', [])
     unique_metrics = set()
-    timestamp_map = {} # Map metric to timestamp if special handling needed
-
+    timestamp_map = {} 
     now = datetime.now(timezone.utc)
     current_year = now.year
     current_month = now.month
-    
-    # Regex to identify monthly badges: YYYY_MM_monthly
-    
     count = 0
 
     if mode == "daily":
@@ -354,53 +363,37 @@ async def process_quests(session, jwt, user_id, mode="daily"):
                 if g.get('metric'):
                     unique_metrics.add(g.get('metric'))
                     count += 1
-        # Set timestamp to middle of current month to be safe
         ts_date = datetime(current_year, current_month, 15, 12, 0, 0, tzinfo=timezone.utc)
         ts_str = ts_date.isoformat()
 
     elif mode == "all_previous":
-        processed_months = 0
         for g in goals:
             gid = g.get('goalId', '')
-            # Check if it looks like a monthly badge
             parts = gid.split('_')
             if len(parts) >= 3 and parts[2] == 'monthly':
                 try:
                     y = int(parts[0])
                     m = int(parts[1])
-                    # Check if it's in the past
                     if y < current_year or (y == current_year and m < current_month):
                         if g.get('metric'):
-                            # For batching previous months, we technically need separate requests per month
-                            # to get the timestamp right, OR we can try sending them all.
-                            # Best practice: Send one request per month found.
-                            
-                            # We will store them to process individually below
                             m_ts = datetime(y, m, 15, 12, 0, 0, tzinfo=timezone.utc).isoformat()
                             if m_ts not in timestamp_map: timestamp_map[m_ts] = []
                             timestamp_map[m_ts].append(g.get('metric'))
-                            processed_months += 1
                 except: continue
         
-        # If all_previous, we process the timestamp map
         if not timestamp_map: return "No previous monthly badges found."
-        
         success_count = 0
         for ts, metrics in timestamp_map.items():
-            if await brute_force_metrics(session, jwt, user_id, list(set(metrics)), ts):
-                success_count += 1
+            if await brute_force_metrics(session, jwt, user_id, list(set(metrics)), ts): success_count += 1
             await asyncio.sleep(0.5)
         return f"Processed {success_count} past months."
 
-    # Process Daily or Current Monthly (Single Request)
     if unique_metrics:
         success = await brute_force_metrics(session, jwt, user_id, list(unique_metrics), ts_str)
         if success: return f"Successfully completed {mode} quests."
         else: return "Request failed."
     
-    if mode != "all_previous" and count == 0:
-        return f"No active {mode} quests found."
-        
+    if mode != "all_previous" and count == 0: return f"No active {mode} quests found."
     return "Unknown error."
 
 # --- CORE DUOLINGO ACTIONS ---
@@ -418,9 +411,7 @@ async def perform_one_lesson(session, jwt, user_id, from_lang, learning_lang):
             
         session_id = sess_data.get('id')
         if not session_id: return False
-
         await asyncio.sleep(2) 
-
         now_ts = datetime.now(timezone.utc).timestamp()
         update_payload = {
             **sess_data, "heartsLeft": 5, "startTime": now_ts - 60, "endTime": now_ts,
@@ -428,8 +419,7 @@ async def perform_one_lesson(session, jwt, user_id, from_lang, learning_lang):
         }
         async with session.put(f"{SESSIONS_URL}/{session_id}", json=update_payload, headers=headers, timeout=10) as resp:
             return resp.status == 200
-    except:
-        return False
+    except: return False
 
 async def run_xp_story(session, jwt, from_lang, to_lang):
     try:
@@ -446,8 +436,7 @@ async def run_xp_story(session, jwt, from_lang, to_lang):
             if resp.status == 200:
                 data = await resp.json()
                 return data.get("awardedXp", 0)
-    except:
-        pass
+    except: pass
     return 0
 
 # --- SHOP LOGIC ---
@@ -477,8 +466,7 @@ async def purchase_shop_item(session, jwt, user_id, item_id, from_lang, to_lang)
     try:
         async with session.post(url, headers=headers, json=payload) as resp:
             return resp.status == 200
-    except:
-        return False
+    except: return False
 
 # --- LEAGUE LOGIC ---
 async def get_league_position(session, jwt, user_id):
@@ -491,17 +479,13 @@ async def get_league_position(session, jwt, user_id):
         
         active = data.get('active')
         if active is None: return {"banned": True}
-            
         cohort = active.get('cohort', {})
         rankings = cohort.get('rankings', [])
-        
         my_data = next((u for u in rankings if str(u.get('user_id')) == str(user_id)), None)
         if not my_data: return None
-
         my_rank = next((i + 1 for i, u in enumerate(rankings) if str(u.get('user_id')) == str(user_id)), None)
         return {"rank": my_rank, "score": my_data.get('score'), "rankings": rankings, "banned": False}
-    except Exception as e:
-        print(f"League Fetch Error: {e}")
+    except: pass
     return None
 
 async def league_saver_logic(session, jwt, user_id, target_rank, from_lang, to_lang, update_msg=None):
@@ -509,13 +493,10 @@ async def league_saver_logic(session, jwt, user_id, target_rank, from_lang, to_l
     try:
         data = await get_league_position(session, jwt, user_id)
         if not data: return "Could not fetch leaderboard data."
-
-        if data.get("banned"):
-            return "❌ User is BANNED from Leagues."
+        if data.get("banned"): return "❌ User is BANNED from Leagues."
         
         current_rank = data['rank']
-        if current_rank <= target_rank:
-            return f"Safe at Rank #{current_rank}."
+        if current_rank <= target_rank: return f"Safe at Rank #{current_rank}."
 
         rankings = data['rankings']
         target_idx = min(len(rankings)-1, target_rank - 1)
@@ -553,8 +534,7 @@ async def league_saver_logic(session, jwt, user_id, target_rank, from_lang, to_l
             await asyncio.sleep(0.5)
 
         return f"Finished. Farmed {farmed_session_xp} XP to secure rank."
-    except Exception as e:
-        return f"Error: {e}"
+    except Exception as e: return f"Error: {e}"
 
 # --- VIEWS & MODALS ---
 
@@ -687,7 +667,8 @@ class FarmModal(Modal):
             "duo_id": self.duo_id,
             "target": amount,
             "progress": 0,
-            "delay": self.delay_ms # Store delay for ETA calculation
+            "delay": self.delay_ms,
+            "jwt": self.jwt # Saved for System Recovery
         }
 
         await interaction.followup.send(embed=build_embed(f"{EMOJI_CHECK} Started {self.farm_type}", f"Farm started for `{self.username}`.\nCheck <#{FARM_LOG_CHANNEL_ID}> for logs.", DUO_GREEN), ephemeral=True)
@@ -727,6 +708,7 @@ async def farm_xp_logic(discord_user_id, jwt, duo_id, username, amount, from_lan
             sleep_time = delay_ms / 1000.0
 
             for i in range(max_req):
+                if bot_is_stopping: return
                 if farm_key in active_farms: active_farms[farm_key]['progress'] = total_xp_farmed
                 now_ts = int(time.time())
                 payload = {"awardXp": True, "completedBonusChallenge": True, "fromLanguage": from_lang, "learningLanguage": to_lang, "hasXpBoost": False, "illustrationFormat": "svg", "isFeaturedStoryInPracticeHub": True, "isLegendaryMode": True, "isV2Redo": False, "isV2Story": False, "masterVersion": True, "maxScore": 0, "score": 0, "happyHourBonusXp": 469, "startTime": now_ts, "endTime": now_ts + random.randint(300, 420)}
@@ -736,7 +718,7 @@ async def farm_xp_logic(discord_user_id, jwt, duo_id, username, amount, from_lan
                         total_xp_farmed += data.get("awardedXp", 0)
                 await asyncio.sleep(sleep_time)
 
-            if remain_xp >= min_xp_req:
+            if remain_xp >= min_xp_req and not bot_is_stopping:
                 now_ts = int(time.time())
                 bonus_xp = min(max(0, remain_xp - min_xp_req), 469)
                 payload = {"awardXp": True, "completedBonusChallenge": True, "fromLanguage": from_lang, "learningLanguage": to_lang, "hasXpBoost": False, "illustrationFormat": "svg", "isFeaturedStoryInPracticeHub": True, "isLegendaryMode": True, "isV2Redo": False, "isV2Story": False, "masterVersion": True, "maxScore": 0, "score": 0, "happyHourBonusXp": bonus_xp, "startTime": now_ts, "endTime": now_ts + random.randint(40, 60)}
@@ -750,22 +732,21 @@ async def farm_xp_logic(discord_user_id, jwt, duo_id, username, amount, from_lan
             end_clock = time.time()
             elapsed_str = format_time(end_clock - start_clock)
             
-            if channel: 
+            if channel and not bot_is_stopping: 
                 finish_embed = build_embed(f"{EMOJI_CHECK} XP Farm Finished", f"**User:** {discord_user.mention}\n**Account:** `{username}`", DUO_GREEN)
                 finish_embed.add_field(name="Gained", value=f"**+{total_xp_farmed} XP**", inline=True)
                 finish_embed.add_field(name="Time", value=f"`{elapsed_str}`", inline=True)
                 await channel.send(embed=finish_embed)
 
     except asyncio.CancelledError:
-        reason = stop_reasons.get(farm_key, "User Request")
-        if channel and reason == "User Request":
-             await channel.send(embed=build_embed(f"{EMOJI_STOP} Farm Stopped", f"XP Farm for `{username}` stopped manually by {discord_user.mention}.", DUO_RED))
+        pass
     except Exception as e:
-        if channel:
+        if channel and not bot_is_stopping:
             await channel.send(embed=build_embed(f"{EMOJI_WARNING} Farm Error", f"**Error:** {str(e)}\n**Account:** `{username}`", DUO_RED))
     finally:
-        if farm_key in active_farms: del active_farms[farm_key]
-        if farm_key in stop_reasons: del stop_reasons[farm_key]
+        if not bot_is_stopping:
+            if farm_key in active_farms: del active_farms[farm_key]
+            if farm_key in stop_reasons: del stop_reasons[farm_key]
 
 async def farm_gems_logic(discord_user_id, jwt, duo_id, username, loops, from_lang, to_lang, delay_ms):
     channel = get_farm_log_channel()
@@ -783,6 +764,7 @@ async def farm_gems_logic(discord_user_id, jwt, duo_id, username, loops, from_la
             sleep_time = delay_ms / 1000.0
 
             for i in range(loops):
+                if bot_is_stopping: return
                 if farm_key in active_farms: active_farms[farm_key]['progress'] = i + 1
                 rewards_copy = list(GEM_REWARDS)
                 random.shuffle(rewards_copy)
@@ -792,31 +774,27 @@ async def farm_gems_logic(discord_user_id, jwt, duo_id, username, loops, from_la
                         payload = {"consumed": True, "fromLanguage": from_lang, "learningLanguage": to_lang}
                         try:
                             async with session.patch(url, headers=headers, json=payload, timeout=5) as resp: pass
-                        except asyncio.CancelledError:
-                            raise 
-                        except Exception:
-                            pass
+                        except: pass
                 total_gems += 120
                 await asyncio.sleep(sleep_time)
 
             end_clock = time.time()
             elapsed_str = format_time(end_clock - start_clock)
-            if channel: 
+            if channel and not bot_is_stopping: 
                 finish_embed = build_embed(f"{EMOJI_CHECK} Gem Farm Finished", f"**User:** {discord_user.mention}\n**Account:** `{username}`", DUO_GREEN)
                 finish_embed.add_field(name="Earned", value=f"**~{total_gems} Gems**", inline=True)
                 finish_embed.add_field(name="Time", value=f"`{elapsed_str}`", inline=True)
                 await channel.send(embed=finish_embed)
 
     except asyncio.CancelledError:
-        reason = stop_reasons.get(farm_key, "User Request")
-        if channel and reason == "User Request":
-             await channel.send(embed=build_embed(f"{EMOJI_STOP} Farm Stopped", f"Gem Farm for `{username}` stopped by {discord_user.mention}.", DUO_RED))
+        pass
     except Exception as e:
-        if channel:
+        if channel and not bot_is_stopping:
             await channel.send(embed=build_embed(f"{EMOJI_WARNING} Farm Error", f"**Error:** {str(e)}\n**Account:** `{username}`", DUO_RED))
     finally:
-        if farm_key in active_farms: del active_farms[farm_key]
-        if farm_key in stop_reasons: del stop_reasons[farm_key]
+        if not bot_is_stopping:
+            if farm_key in active_farms: del active_farms[farm_key]
+            if farm_key in stop_reasons: del stop_reasons[farm_key]
 
 async def farm_streak_logic(discord_user_id, jwt, duo_id, username, amount, from_lang, to_lang, delay_ms):
     channel = get_farm_log_channel()
@@ -831,14 +809,9 @@ async def farm_streak_logic(discord_user_id, jwt, duo_id, username, amount, from
         timeout_settings = aiohttp.ClientTimeout(total=300, connect=10, sock_read=10)
         
         async with aiohttp.ClientSession(timeout=timeout_settings) as session:
-            try:
-                profile = await get_duo_profile(session, jwt, duo_id)
-            except Exception:
-                profile = None
-
-            if not profile:
-                if channel: await channel.send(f"❌ Could not fetch profile for `{username}`. Aborting.")
-                return
+            try: profile = await get_duo_profile(session, jwt, duo_id)
+            except: profile = None
+            if not profile: return
             
             s_data = profile.get('streakData') or {}
             curr_streak = s_data.get('currentStreak')
@@ -859,7 +832,7 @@ async def farm_streak_logic(discord_user_id, jwt, duo_id, username, amount, from
             headers = get_headers(jwt, duo_id)
             
             for i in range(amount):
-                if farm_key not in active_farms: raise asyncio.CancelledError("Farm removed")
+                if bot_is_stopping: return
                 if farm_key in active_farms: active_farms[farm_key]['progress'] = success_cnt
 
                 sim_day = farm_start - timedelta(days=i)
@@ -872,11 +845,7 @@ async def farm_streak_logic(discord_user_id, jwt, duo_id, username, amount, from
                         if resp.status == 200:
                             sess_data = await resp.json()
                             sess_id = sess_data.get('id')
-                        elif resp.status == 429:
-                            await asyncio.sleep(5)
-                            continue
-                except (asyncio.TimeoutError, aiohttp.ClientError):
-                    continue
+                except: continue
                 
                 if not sess_id: continue
 
@@ -889,8 +858,7 @@ async def farm_streak_logic(discord_user_id, jwt, duo_id, username, amount, from
                 try:
                     async with session.put(f"{SESSIONS_URL}/{sess_id}", headers=headers, json=update_payload, timeout=10) as resp:
                         if resp.status == 200: success_cnt += 1
-                except (asyncio.TimeoutError, aiohttp.ClientError):
-                    continue
+                except: continue
                 
                 await asyncio.sleep(sleep_time + random.uniform(0.1, 0.3))
 
@@ -898,22 +866,21 @@ async def farm_streak_logic(discord_user_id, jwt, duo_id, username, amount, from
 
             end_clock = time.time()
             elapsed_str = format_time(end_clock - start_clock)
-            if channel: 
+            if channel and not bot_is_stopping: 
                 finish_embed = build_embed(f"{EMOJI_CHECK} Streak Farm Finished", f"**User:** {discord_user.mention}\n**Account:** `{username}`", DUO_GREEN)
                 finish_embed.add_field(name="Restored", value=f"**{success_cnt} Days**", inline=True)
                 finish_embed.add_field(name="Time", value=f"`{elapsed_str}`", inline=True)
                 await channel.send(embed=finish_embed)
 
     except asyncio.CancelledError:
-        reason = stop_reasons.get(farm_key, "User Request")
-        if channel and reason == "User Request":
-             await channel.send(embed=build_embed(f"{EMOJI_STOP} Farm Stopped", f"Streak Farm for `{username}` stopped by {discord_user.mention}.", DUO_RED))
+        pass
     except Exception as e:
-        if channel:
+        if channel and not bot_is_stopping:
             await channel.send(embed=build_embed(f"{EMOJI_WARNING} Farm Error", f"**Error:** {str(e)}\n**Account:** `{username}`", DUO_RED))
     finally:
-        if farm_key in active_farms: del active_farms[farm_key]
-        if farm_key in stop_reasons: del stop_reasons[farm_key]
+        if not bot_is_stopping:
+            if farm_key in active_farms: del active_farms[farm_key]
+            if farm_key in stop_reasons: del stop_reasons[farm_key]
 
 async def process_login(interaction, jwt):
     duo_id = await extract_user_id(jwt)
@@ -993,10 +960,8 @@ async def streak_monitor():
                     if not p: continue
                     
                     timezone_str = p.get("timezone", "Asia/Saigon")
-                    try:
-                        user_tz = pytz.timezone(timezone_str)
-                    except pytz.exceptions.UnknownTimeZoneError:
-                        user_tz = pytz.timezone("Asia/Saigon")
+                    try: user_tz = pytz.timezone(timezone_str)
+                    except: user_tz = pytz.timezone("Asia/Saigon")
                         
                     now = datetime.now(user_tz)
                     streak_data = p.get('streakData', {})
@@ -1071,10 +1036,8 @@ async def league_monitor():
 
 @tasks.loop(hours=6)
 async def quest_monitor():
-    """Checks for active Quest Savers and completes Daily & Current Month quests."""
     channel = get_saver_log_channel()
     pipeline = [{"$match": {"accounts.quest_saver": True}}, {"$project": {"count": {"$size": {"$filter": {"input": "$accounts", "as": "acc", "cond": "$$acc.quest_saver"}}}}}, {"$group": {"_id": None, "total": {"$sum": "$count"}}}]
-    
     users_to_check = 0
     async for doc in users_collection.aggregate(pipeline):
         users_to_check = doc.get("total", 0)
@@ -1092,11 +1055,8 @@ async def quest_monitor():
             for acc in user_doc.get("accounts", []):
                 if not acc.get("quest_saver", False): continue
                 try:
-                    # Complete Daily Quests
                     res_daily = await process_quests(session, acc['jwt'], acc['duo_id'], "daily")
-                    # Complete Monthly Badge (Current)
                     res_monthly = await process_quests(session, acc['jwt'], acc['duo_id'], "monthly_current")
-                    
                     if "Successfully" in res_daily or "Successfully" in res_monthly:
                         completed_users.append(discord_id)
                     await asyncio.sleep(1.5)
@@ -1112,14 +1072,60 @@ async def quest_monitor():
         else: embed.add_field(name="Status", value="All quests were already up to date.", inline=False)
         await channel.send(embed=embed)
 
+async def resume_tasks():
+    """Resumes tasks saved from previous instance."""
+    print("🔎 Checking for incomplete tasks from previous instance...")
+    backups = await recovery_collection.find({}).to_list(length=None)
+    if not backups:
+        print("✅ No incomplete tasks found.")
+        return
+
+    print(f"♻️ Resuming {len(backups)} tasks...")
+    async with aiohttp.ClientSession() as temp_sess:
+        for data in backups:
+            try:
+                # Re-fetch minimal profile for langs
+                p = await get_duo_profile(temp_sess, data['jwt'], data['duo_id'])
+                if not p: continue
+                
+                from_lang = p.get('fromLanguage', 'en')
+                to_lang = p.get('learningLanguage', 'fr')
+                
+                # Logic to restart the specific type
+                if data['type'] == "XP":
+                    task = asyncio.create_task(farm_xp_logic(data['user_id'], data['jwt'], data['duo_id'], data['username'], data['remaining'], from_lang, to_lang, data['delay']))
+                elif data['type'] in ["Gems", "Gem"]:
+                    task = asyncio.create_task(farm_gems_logic(data['user_id'], data['jwt'], data['duo_id'], data['username'], data['remaining'], from_lang, to_lang, data['delay']))
+                elif data['type'] == "Streak":
+                    task = asyncio.create_task(farm_streak_logic(data['user_id'], data['jwt'], data['duo_id'], data['username'], data['remaining'], from_lang, to_lang, data['delay']))
+                else: continue
+
+                active_farms[data['key']] = {
+                    "type": data['type'],
+                    "task": task,
+                    "user_id": data['user_id'],
+                    "username": data['username'],
+                    "duo_id": data['duo_id'],
+                    "target": data['remaining'], # Target becomes the remainder
+                    "progress": 0, # Reset progress visual for the new target
+                    "delay": data['delay'],
+                    "jwt": data['jwt']
+                }
+            except Exception as e:
+                print(f"Failed to resume task {data.get('key')}: {e}")
+
+    await recovery_collection.delete_many({})
+    print("✨ Task resumption complete.")
+
 @bot.event
 async def on_ready():
-    print(f'[{datetime.now().strftime("%H:%M:%S")}] Logged in as {bot.user}')
+    print(f'[{datetime.now().strftime("%H:%M:%S")}] System Online: {bot.user}')
     if not streak_monitor.is_running(): streak_monitor.start()
     if not league_monitor.is_running(): league_monitor.start()
     if not quest_monitor.is_running(): quest_monitor.start()
+    await resume_tasks()
 
-# --- VIEWS ---
+# --- VIEWS (REMAINING) ---
 
 class FarmStatusView(View):
     def __init__(self, user_active_farms):
@@ -1167,7 +1173,6 @@ class FarmStatusView(View):
             total = data['target']
             bar = create_progress_bar(current, total)
             
-            # ETA Calculation
             delay = data.get('delay', 100)
             remaining = total - current
             
@@ -1351,7 +1356,7 @@ async def admin_cmd(ctx: discord.ApplicationContext):
     embed = await view.get_stats_embed()
     await ctx.respond(embed=embed, view=view, ephemeral=True)
 
-# --- QUEST VIEWS ---
+# --- HELPER CLASSES FOR VIEWS ---
 
 class QuestAccountSelect(Select):
     def __init__(self, accounts, author_id):
@@ -1359,7 +1364,6 @@ class QuestAccountSelect(Select):
         self.author_id = author_id
         options = [SelectOption(label=acc['username'], value=str(i), emoji=EMOJI_DUO_RAIN) for i, acc in enumerate(accounts)]
         super().__init__(placeholder="Select Account for Quests...", min_values=1, max_values=1, options=options)
-    
     async def callback(self, interaction: Interaction):
         acc = self.accounts[int(self.values[0])]
         view = QuestsView(acc, self.author_id)
@@ -1380,18 +1384,13 @@ class QuestActionSelect(Select):
             SelectOption(label="Complete ALL Previous", value="all_previous", emoji=EMOJI_CHEST, description="Unlock badges from past months")
         ]
         super().__init__(placeholder="Choose an Action...", min_values=1, max_values=1, options=options)
-
     async def callback(self, interaction: Interaction):
         await interaction.response.defer(ephemeral=True)
         mode = self.values[0]
-        
         async with aiohttp.ClientSession() as session:
             result = await process_quests(session, self.account['jwt'], self.account['duo_id'], mode)
-        
         color = DUO_GREEN if "Successfully" in result or "Processed" in result else DUO_RED
         await interaction.followup.send(embed=build_embed("Quest Result", result, color), ephemeral=True)
-
-# --- SHOP VIEWS ---
 
 class ShopAccountSelect(Select):
     def __init__(self, accounts, author_id):
@@ -1564,14 +1563,12 @@ class DelaySelect(Select):
         d_xp = delays.get("XP", 100)
         d_gem = delays.get("Gem", 100)
         d_str = delays.get("Streak", 100)
-        
         options = [
             SelectOption(label=f"XP Delay ({d_xp}ms)", value="XP", emoji=EMOJI_XP),
             SelectOption(label=f"Gem Delay ({d_gem}ms)", value="Gem", emoji=EMOJI_GEM),
             SelectOption(label=f"Streak Delay ({d_str}ms)", value="Streak", emoji=EMOJI_STREAK)
         ]
         super().__init__(placeholder="Select Delay Type to Edit...", min_values=1, max_values=1, options=options, row=0)
-
     async def callback(self, interaction: Interaction):
         delay_type = self.values[0]
         await interaction.response.send_modal(DelayModal(self.account, delay_type))
@@ -1584,14 +1581,12 @@ class FarmTypeSelect(Select):
         xp_delay = delays.get("XP", 100)
         gem_delay = delays.get("Gem", 100)
         streak_delay = delays.get("Streak", 100)
-
         options = [
             SelectOption(label=f"XP Farm ({xp_delay} ms)", value="XP Farm", emoji=EMOJI_XP, description="Farm XP using High-Yield method"),
             SelectOption(label=f"Gem Farm ({gem_delay} ms)", value="Gem Farm", emoji=EMOJI_GEM, description="Farm Gems (60 per loop)"),
             SelectOption(label=f"Streak Farm ({streak_delay} ms)", value="Streak Farm", emoji=EMOJI_STREAK, description="Restore or increase streak")
         ]
         super().__init__(placeholder="Select a Farm Type...", min_values=1, max_values=1, options=options, row=0)
-    
     async def callback(self, interaction: Interaction):
         farm_type_clean = self.values[0].replace(" Farm", "")
         type_key = "Gem" if "Gem" in farm_type_clean else farm_type_clean
@@ -1785,10 +1780,8 @@ class SaverView(View):
         await interaction.response.defer(ephemeral=True)
         acc = self.get_current_acc()
         async with aiohttp.ClientSession() as session:
-            # Completing daily and current monthly
             res1 = await process_quests(session, acc['jwt'], acc['duo_id'], "daily")
             res2 = await process_quests(session, acc['jwt'], acc['duo_id'], "monthly_current")
-            
         color = DUO_GREEN if ("Successfully" in res1 or "Successfully" in res2) else DUO_RED
         await interaction.followup.send(embed=build_embed("Quest Result", f"**Daily:** {res1}\n**Monthly:** {res2}", color), ephemeral=True)
 
@@ -1871,7 +1864,6 @@ class AdminDeleteUserModal(Modal):
     def __init__(self, *args, **kwargs):
         super().__init__(title="DELETE SPECIFIC USER", *args, **kwargs)
         self.add_item(InputText(label="Discord User ID", placeholder="123456789...", required=True))
-
     async def callback(self, interaction: Interaction):
         try:
             uid = int(self.children[0].value)
@@ -1887,7 +1879,6 @@ class AdminNukeConfirm(Modal):
     def __init__(self, *args, **kwargs):
         super().__init__(title="CONFIRM DATABASE DELETION", *args, **kwargs)
         self.add_item(InputText(label="Type 'DELETE' to confirm", placeholder="DELETE", required=True))
-
     async def callback(self, interaction: Interaction):
         if self.children[0].value == "DELETE":
             await users_collection.delete_many({})
@@ -1903,23 +1894,19 @@ class DBUserListView(View):
         self.per_page = 5
         self.max_page = max(0, (len(users_list) - 1) // self.per_page)
         self.update_buttons()
-
     def update_buttons(self):
         self.prev_btn.disabled = (self.page == 0)
         self.next_btn.disabled = (self.page == self.max_page)
-
     @discord.ui.button(emoji=EMOJI_PREV, style=discord.ButtonStyle.secondary)
     async def prev_btn(self, button: Button, interaction: Interaction):
         self.page -= 1
         self.update_buttons()
         await interaction.response.edit_message(embed=self.get_embed(), view=self)
-
     @discord.ui.button(emoji=EMOJI_NEXT, style=discord.ButtonStyle.secondary)
     async def next_btn(self, button: Button, interaction: Interaction):
         self.page += 1
         self.update_buttons()
         await interaction.response.edit_message(embed=self.get_embed(), view=self)
-
     def get_embed(self):
         start = self.page * self.per_page
         end = start + self.per_page
