@@ -13,7 +13,6 @@ import sys
 import pytz
 from datetime import datetime, timedelta, timezone
 
-                            
 import discord
 from discord import InputTextStyle, Interaction, SelectOption
 from discord.ui import View, Button, Modal, InputText, Select 
@@ -21,20 +20,18 @@ from discord.ext import commands, tasks
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
 
-                       
+# Load Environment Variables
 load_dotenv()
 
 TOKEN = os.getenv('DISCORD_TOKEN')
 MONGODB_URI = os.getenv('MONGODB_URI')
 
-                                   
+# Configuration
 ADMIN_ID = 1122147581187866660 
-
-          
 FARM_LOG_CHANNEL_ID = 1452166255363489917
 SAVER_LOG_CHANNEL_ID = 1452339685555834941
 
-                                    
+# Colors
 DUO_GREEN = 0x58CC02
 DUO_RED = 0xFF4B4B
 DUO_BLUE = 0x1CB0F6
@@ -43,7 +40,7 @@ DUO_PURPLE = 0xCE82FF
 DUO_DARK = 0x0F172A
 DUO_GOLD = 0xF1C40F
 
-               
+# Emojis
 EMOJI_XP = "<:XP:1452179297300250749>"
 EMOJI_GEM = "<:Gem:1452195859780603924>"
 EMOJI_STREAK = "<:Streak:1452177768707260576>" 
@@ -55,7 +52,6 @@ EMOJI_TASTE = "<:freetaste:1452210193000697991>"
 EMOJI_MISC = "<:misc:1452211033375641766>"
 EMOJI_DUO_RAIN = "<:DuoRain:1452268882302599269>"
 
-                    
 EMOJI_CHECK = "✅"
 EMOJI_CROSS = "❌"
 EMOJI_TRASH = "🗑️"
@@ -83,7 +79,7 @@ EMOJI_SHOP = "🛒"
 EMOJI_QUEST = "📜"
 EMOJI_CHEST = "🎁"
 
-                            
+# Duolingo API Constants
 BASE_URL_V1 = "https://www.duolingo.com/2017-06-30"
 BASE_URL_V2 = "https://www.duolingo.com/2023-05-23"
 SESSIONS_URL = f"{BASE_URL_V1}/sessions"
@@ -111,7 +107,6 @@ CHALLENGE_TYPES = [
     "typeClozeTable", "typeComplete", "typeCompleteTable", "writeComprehension"
 ]
 
-                   
 RAW_SHOP_ITEMS = [
     {"id": "streak_freeze", "name": "Streak Freeze", "type": "misc", "price": 200, "currencyType": "XGM"},
     {"id": "streak_freeze_gift", "name": "Streak Freeze Gift", "type": "misc", "price": 20, "currencyType": "XGM"},
@@ -127,19 +122,19 @@ RAW_SHOP_ITEMS = [
     {"id": "health_refill", "name": "Health Refill", "type": "misc", "price": 350, "currencyType": "XGM"}
 ]
 
-                                 
+# Global State
 active_farms = {}
 stop_reasons = {}
 start_time = time.time()
 bot_is_stopping = False
 shutdown_flag = asyncio.Event()
 
-                         
+# Bot Setup
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-                     
+# MongoDB Connection
 try:
     mongo_client = AsyncIOMotorClient(MONGODB_URI, tlsCAFile=certifi.where())
     db = mongo_client["duo_streak_saver"]
@@ -150,8 +145,8 @@ except Exception as e:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ MongoDB Connection Error: {e}")
     sys.exit(1)
 
-                                        
 
+# --- RECOVERY LOGIC ---
 async def save_state_and_exit():
     """Saves running farms to MongoDB before the instance dies."""
     global bot_is_stopping
@@ -166,7 +161,7 @@ async def save_state_and_exit():
     for key, data in active_farms.items():
         if data['task'].done(): continue
         
-                                                    
+        # Calculate remaining work
         remaining = data['target'] - data['progress']
         if remaining <= 0: continue
 
@@ -178,44 +173,25 @@ async def save_state_and_exit():
             "duo_id": data['duo_id'],
             "remaining": remaining,                             
             "delay": data['delay'],
-                                                                       
-                                                                                                      
         }
-                                                                                               
-                                                                          
-                                                                                     
+        
         if 'jwt' in data:
             state_entry['jwt'] = data['jwt']
         else:
-                                                                         
-                                                  
-                                                                             
              continue
 
         backup_data.append(state_entry)
 
     if backup_data:
+        # Clear old recovery data and insert new
         await recovery_collection.delete_many({})                   
         await recovery_collection.insert_many(backup_data)
         print(f"✅ Saved {len(backup_data)} active tasks to recovery database.")
     
     print("👋 Shutting down.")
 
-def signal_handler(sig, frame):
-    """Handles SIGTERM from GitHub Actions timeout."""
-    asyncio.create_task(save_state_and_exit_wrapper())
 
-async def save_state_and_exit_wrapper():
-    await save_state_and_exit()
-    await bot.close()
-    sys.exit(0)
-
-                  
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-
-                          
-
+# --- HELPERS ---
 def build_embed(title, description=None, color=DUO_BLUE, thumbnail=None):
     embed = discord.Embed(title=title, description=description, color=color, timestamp=datetime.now())
     if thumbnail:
@@ -315,7 +291,7 @@ def is_social_disabled(privacy_settings):
             return s.get('enabled', False)
     return False
 
-                      
+# --- API INTERACTIONS ---
 async def get_goals_schema(session, jwt):
     try:
         url = f"{GOALS_URL}/schema?ui_language=en"
@@ -396,7 +372,6 @@ async def process_quests(session, jwt, user_id, mode="daily"):
     if mode != "all_previous" and count == 0: return f"No active {mode} quests found."
     return "Unknown error."
 
-                               
 
 async def perform_one_lesson(session, jwt, user_id, from_lang, learning_lang):
     try:
@@ -439,7 +414,6 @@ async def run_xp_story(session, jwt, from_lang, to_lang):
     except: pass
     return 0
 
-                    
 def categorize_items():
     cats = {"XP Boosts": [], "Health/Hearts": [], "Outfits": [], "Misc": []}
     for item in RAW_SHOP_ITEMS:
@@ -468,7 +442,6 @@ async def purchase_shop_item(session, jwt, user_id, item_id, from_lang, to_lang)
             return resp.status == 200
     except: return False
 
-                      
 async def get_league_position(session, jwt, user_id):
     try:
         headers = get_headers(jwt, user_id)
@@ -536,7 +509,7 @@ async def league_saver_logic(session, jwt, user_id, target_rank, from_lang, to_l
         return f"Finished. Farmed {farmed_session_xp} XP to secure rank."
     except Exception as e: return f"Error: {e}"
 
-                        
+# --- DISCORD UI COMPONENTS ---
 
 class ProtectedView(View):
     def __init__(self, author_id, timeout=180):
@@ -673,7 +646,6 @@ class FarmModal(Modal):
 
         await interaction.followup.send(embed=build_embed(f"{EMOJI_CHECK} Started {self.farm_type}", f"Farm started for `{self.username}`.\nCheck <#{FARM_LOG_CHANNEL_ID}> for logs.", DUO_GREEN), ephemeral=True)
 
-                                 
 
 def get_farm_log_channel():
     return bot.get_channel(FARM_LOG_CHANNEL_ID)
@@ -931,7 +903,7 @@ async def process_login(interaction, jwt):
         embed.add_field(name=f"{EMOJI_STREAK} Streak", value=f"**{streak:,}**", inline=True)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-                                     
+# --- BACKGROUND TASKS ---
 
 @tasks.loop(hours=4)
 async def streak_monitor():
@@ -1084,14 +1056,14 @@ async def resume_tasks():
     async with aiohttp.ClientSession() as temp_sess:
         for data in backups:
             try:
-                                                    
+                # Refresh profile to get current language settings
                 p = await get_duo_profile(temp_sess, data['jwt'], data['duo_id'])
                 if not p: continue
                 
                 from_lang = p.get('fromLanguage', 'en')
                 to_lang = p.get('learningLanguage', 'fr')
                 
-                                                    
+                # Restart the specific task
                 if data['type'] == "XP":
                     task = asyncio.create_task(farm_xp_logic(data['user_id'], data['jwt'], data['duo_id'], data['username'], data['remaining'], from_lang, to_lang, data['delay']))
                 elif data['type'] in ["Gems", "Gem"]:
@@ -1125,7 +1097,6 @@ async def on_ready():
     if not quest_monitor.is_running(): quest_monitor.start()
     await resume_tasks()
 
-                           
 
 class FarmStatusView(View):
     def __init__(self, user_active_farms):
@@ -1245,8 +1216,6 @@ class FarmStatusView(View):
                 active_farms[key]['task'].cancel()
                 stop_reasons[key] = "User Request"
 
-                  
-
 @bot.slash_command(name="guide", description="Learn how to get your Duolingo JWT Token")
 async def guide_cmd(ctx: discord.ApplicationContext):
     embed = build_embed("🎟️ How to get your Login Token", "Steps to get your JWT Token from Duolingo web:", DUO_BLUE)
@@ -1355,8 +1324,6 @@ async def admin_cmd(ctx: discord.ApplicationContext):
     view = AdminView()
     embed = await view.get_stats_embed()
     await ctx.respond(embed=embed, view=view, ephemeral=True)
-
-                                  
 
 class QuestAccountSelect(Select):
     def __init__(self, accounts, author_id):
@@ -1923,5 +1890,44 @@ class DBUserListView(View):
         embed.set_footer(text=f"Page {self.page+1}/{self.max_page+1}")
         return embed
 
+# =========================================================================
+#  SHUTDOWN HANDLER
+#  Catches SIGTERM/SIGINT from GitHub Actions timeout (20700s)
+# =========================================================================
+
+async def shutdown_sequence():
+    """
+    Triggered by the YAML 'timeout' command at 5h 45m (20700s).
+    """
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🛑 Time Limit Reached (5h 45m).")
+    print("⏳ Saving state to MongoDB...")
+    
+    # Run the save logic
+    await save_state_and_exit()
+    
+    print("✅ Save complete. Closing connection.")
+    await bot.close()
+    sys.exit(0)
+
 if __name__ == "__main__":
-    if TOKEN: bot.run(TOKEN)
+    if not TOKEN:
+        print("Error: DISCORD_TOKEN is missing.")
+        sys.exit(1)
+
+    # Explicit loop creation for safe signal handling
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # Register the signal that catches the 'timeout 20700s' command
+    try:
+        loop.add_signal_handler(signal.SIGTERM, lambda: loop.create_task(shutdown_sequence()))
+        loop.add_signal_handler(signal.SIGINT, lambda: loop.create_task(shutdown_sequence()))
+    except NotImplementedError:
+        pass # Windows fallback
+
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] 🟢 Bot Online. Scheduled restart in 5h 45m.")
+    
+    try:
+        bot.run(TOKEN)
+    except Exception as e:
+        print(f"Runtime Error: {e}")
