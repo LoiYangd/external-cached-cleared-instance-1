@@ -9,7 +9,7 @@ jobs:
   system-integrity:
     name: Instance Verification
     runs-on: ubuntu-latest
-    timeout-minutes: 360 
+    timeout-minutes: 360
 
     steps:
       - name: Checkout Repository
@@ -30,7 +30,8 @@ jobs:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
           PYTHONUNBUFFERED: "1"
-        run: timeout 21000s python main.py || true
+          
+        run: timeout 19800s python main.py || true
 
       - name: Rotate Instance
         if: always()
