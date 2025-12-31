@@ -1423,9 +1423,15 @@ class AccountSelect(Select):
         super().__init__(placeholder="Switch Account...", min_values=1, max_values=1, options=options, row=0)
     async def callback(self, interaction: Interaction):
         await interaction.response.defer()
-        idx = int(self.values[0])
-        self.parent_view.current_index = idx
-        await self.parent_view.refresh_dashboard(interaction)
+        try:
+            idx = int(self.values[0])
+            # Check range just in case list size changed
+            if idx < 0 or idx >= len(self.accounts):
+                return await interaction.followup.send(embed=build_embed("Error", "Selection out of range. Please refresh.", DUO_RED), ephemeral=True)
+            self.parent_view.current_index = idx
+            await self.parent_view.refresh_dashboard(interaction)
+        except Exception:
+             await interaction.followup.send(embed=build_embed("Error", "Something went wrong. Please refresh.", DUO_RED), ephemeral=True)
 
 class DashboardView(View):
     def __init__(self, user_doc, accounts):
@@ -1472,10 +1478,42 @@ class DashboardView(View):
 
     @discord.ui.button(label="Remove", style=discord.ButtonStyle.danger, emoji=EMOJI_TRASH, row=1)
     async def remove_account_btn(self, button: Button, interaction: Interaction):
-        if not self.accounts: return await interaction.response.send_message(embed=build_embed("Error", "No accounts to remove.", DUO_RED), ephemeral=True)
+        if not self.accounts: 
+            return await interaction.response.send_message(embed=build_embed("Error", "No accounts to remove.", DUO_RED), ephemeral=True)
+        
         current_acc = self.accounts[self.current_index]
+        target_duo_id = str(current_acc['duo_id'])
+
+        # --- STOP ACTIVE FARMS FOR THIS ACCOUNT ---
+        stopped_farms = []
+        keys_to_delete = []
+
+        for key, data in active_farms.items():
+            if str(data.get('duo_id')) == target_duo_id:
+                data['task'].cancel()
+                keys_to_delete.append(key)
+                stopped_farms.append(data['type'])
+        
+        for key in keys_to_delete:
+            stop_reasons[key] = "Account Deleted"
+            if key in active_farms:
+                del active_farms[key]
+        # ------------------------------------------
+
         await users_collection.update_one({"_id": interaction.user.id}, {"$pull": {"accounts": {"duo_id": current_acc['duo_id']}}})
-        await interaction.response.send_message(embed=build_embed(f"{EMOJI_TRASH} Removed", f"Removed **{current_acc.get('username')}**.", DUO_ORANGE), ephemeral=True)
+        
+        msg = f"Removed **{current_acc.get('username')}**."
+        if stopped_farms:
+            msg += f"\n🛑 Force stopped active farms: {', '.join(stopped_farms)}"
+
+        await interaction.response.send_message(embed=build_embed(f"{EMOJI_TRASH} Removed", msg, DUO_ORANGE), ephemeral=True)
+
+        # Update local state immediately so dropdowns refresh
+        updated_doc = await users_collection.find_one({"_id": interaction.user.id})
+        self.user_doc = updated_doc if updated_doc else {"_id": interaction.user.id, "accounts": []}
+        self.accounts = self.user_doc.get("accounts", [])
+        self.current_index = 0
+        await self.refresh_dashboard(interaction)
 
     @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary, emoji=EMOJI_REFRESH, row=1)
     async def refresh_btn(self, button: Button, interaction: Interaction):
