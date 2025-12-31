@@ -30,12 +30,12 @@ jobs:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
           PYTHONUNBUFFERED: "1"
-          
-        run: timeout 19800s python main.py || true
+        run: timeout 20700s python main.py || true
 
       - name: Rotate Instance
         if: always()
         run: |
+          sleep 60
           curl -X POST https://api.github.com/repos/${{ github.repository }}/dispatches \
           -H "Accept: application/vnd.github.v3+json" \
           -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
